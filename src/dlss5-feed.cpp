@@ -1,6 +1,6 @@
 ﻿// dlss5-feed - ReShade add-on
 //
-// Makes DLSS 5 neural rendering work in a D3D11 game that has no DLSS of its own.
+// Makes DLSS 5 neural rendering work in D3D11/D3D12 games that have no DLSS of their own.
 //
 // The DLSS 5 add-on (renodx-dlss5) only detours NVSDK_NGX_D3D12_CreateFeature /
 // EvaluateFeature and reads the DLSS "contract" it finds there (Color, Depth,
@@ -38,13 +38,13 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.1.0"
+#define FEED_VERSION "0.2.0-dx12"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Feeds DLSS 5 neural rendering with ReShade's depth and LaunchPad motion vectors in games "
-    "without DLSS: runs a real DLSS DLAA pass on a private D3D12 device (where the DLSS 5 add-on "
-    "hooks in) and writes the result back into the frame. Needs DLSS5_Feed.fx + MartysMods LaunchPad. "
+    "Feeds DLSS 5 neural rendering with ReShade depth + LaunchPad motion vectors in D3D11 or D3D12 "
+    "games without DLSS. D3D11 uses the original private-D3D12 bridge; D3D12 evaluates the synthetic "
+    "DLAA contract directly on the game's D3D12 device/command list. Needs DLSS5_Feed.fx + LaunchPad. "
     "Settings in dlss5-feed.cfg, re-read while the game runs.";
 
 // ---------------------------------------------------------------------------
@@ -293,6 +293,27 @@ struct Feed
 
 static Feed g;
 
+// DX12_NATIVE_FEED_PATCH
+struct Feed12
+{
+    ID3D12Device        *dev;       // borrowed from ReShade/game
+    NVSDK_NGX_Parameter *params;
+    NVSDK_NGX_Handle    *feature;
+    ID3D12Resource      *output;
+
+    UINT width, height;
+    DXGI_FORMAT color_fmt, output_fmt;
+    bool hdr;
+    bool ngx_inited;
+    bool feature_ready;
+    bool need_reset;
+    bool disabled;
+    int consecutive_fails;
+    UINT64 frames_done;
+};
+
+static Feed12 g12 = {};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -480,6 +501,46 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
     b.Transition.StateAfter  = to;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     g.list->ResourceBarrier(1, &b);
+}
+
+// DX12_NATIVE_FEED_PATCH
+static void BarrierOn(ID3D12GraphicsCommandList *list, ID3D12Resource *res,
+                      D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+    if (!list || !res || from == to) return;
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = res;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    list->ResourceBarrier(1, &b);
+}
+
+static NVSDK_NGX_Result SafeCreateDLSS12(ID3D12GraphicsCommandList *list,
+                                         NVSDK_NGX_DLSS_Create_Params *cp,
+                                         DWORD *code)
+{
+    *code = 0;
+    __try { return NGX_D3D12_CREATE_DLSS_EXT(list, 1, 1, &g12.feature, g12.params, cp); }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *code = GetExceptionCode();
+        return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF);
+    }
+}
+
+static NVSDK_NGX_Result SafeEvaluateDLSS12(ID3D12GraphicsCommandList *list,
+                                           NVSDK_NGX_D3D12_DLSS_Eval_Params *ep,
+                                           DWORD *code)
+{
+    *code = 0;
+    __try { return NGX_D3D12_EVALUATE_DLSS_EXT(list, g12.feature, g12.params, ep); }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *code = GetExceptionCode();
+        return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -913,6 +974,324 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     SafeRelease(old_smp); SafeRelease(old_il); SafeRelease(old_bs); SafeRelease(old_ds); SafeRelease(old_rs);
 }
 
+
+// ---------------------------------------------------------------------------
+// Native D3D12 host path
+// ---------------------------------------------------------------------------
+// DX12_NATIVE_FEED_PATCH
+
+static void ReleaseFrameResources12()
+{
+    if (g12.feature)
+    {
+        NVSDK_NGX_D3D12_ReleaseFeature(g12.feature);
+        g12.feature = nullptr;
+    }
+    SafeRelease(g12.output);
+    g12.feature_ready = false;
+    g12.width = g12.height = 0;
+    g12.color_fmt = g12.output_fmt = DXGI_FORMAT_UNKNOWN;
+}
+
+static void ShutdownSession12()
+{
+    ReleaseFrameResources12();
+    if (g12.params)
+    {
+        NVSDK_NGX_D3D12_DestroyParameters(g12.params);
+        g12.params = nullptr;
+    }
+    if (g12.ngx_inited && g12.dev)
+    {
+        NVSDK_NGX_D3D12_Shutdown1(g12.dev);
+        g12.ngx_inited = false;
+    }
+    g12.dev = nullptr;
+}
+
+static bool InitSession12(ID3D12Device *dev)
+{
+    if (!dev) return false;
+    if (g12.dev == dev && g12.ngx_inited && g12.params) return true;
+    if (g12.dev && g12.dev != dev) ShutdownSession12();
+
+    Log("################ feed: opening native D3D12 session ################");
+    g12.dev = dev;
+
+    wchar_t data_path[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, data_path, MAX_PATH);
+    if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+
+    NVSDK_NGX_Result r =
+        NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g12.dev, nullptr, NVSDK_NGX_Version_API);
+    Log("[feed12] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
+
+    if (NVSDK_NGX_FAILED(r))
+    {
+        r = NVSDK_NGX_D3D12_Init_with_ProjectID(
+            "a0f57b54-1daf-4934-90ae-c4035c19df04",
+            NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", data_path, g12.dev, nullptr, NVSDK_NGX_Version_API);
+        Log("[feed12] Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
+    }
+
+    if (NVSDK_NGX_FAILED(r))
+    {
+        Warn("native D3D12 NGX would not initialise");
+        g12.disabled = true;
+        return false;
+    }
+
+    g12.ngx_inited = true;
+    r = NVSDK_NGX_D3D12_AllocateParameters(&g12.params);
+    if (NVSDK_NGX_FAILED(r) || !g12.params)
+    {
+        Warn("native D3D12 AllocateParameters failed 0x%08X", r);
+        g12.disabled = true;
+        return false;
+    }
+
+    Log("############# feed: native D3D12 session open #############");
+    return true;
+}
+
+static bool BuildResources12(ID3D12GraphicsCommandList *list, UINT w, UINT h, DXGI_FORMAT bb_fmt)
+{
+    ReleaseFrameResources12();
+
+    g12.width = w;
+    g12.height = h;
+    g12.color_fmt = TypedColorFormat(bb_fmt);
+    g12.output_fmt = OutputFormatFor(g12.color_fmt);
+    g12.hdr = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g12.color_fmt);
+
+    if (g12.color_fmt == DXGI_FORMAT_UNKNOWN)
+    {
+        Warn("native D3D12: unsupported target format %u (%s)", bb_fmt, FormatName(bb_fmt));
+        return false;
+    }
+
+    if (g12.output_fmt != g12.color_fmt)
+    {
+        Warn("native D3D12: %s requires output %s; format-conversion copy-back is not implemented yet",
+             FormatName(g12.color_fmt), FormatName(g12.output_fmt));
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w;
+    rd.Height = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = g12.output_fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    HRESULT hr = g12.dev->CreateCommittedResource(
+        &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
+        nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g12.output));
+
+    if (FAILED(hr) || !g12.output)
+    {
+        Warn("native D3D12: output creation failed 0x%08X", hr);
+        return false;
+    }
+
+    if (g_cfg.mode < 2)
+    {
+        g12.feature_ready = true;
+        g12.need_reset = true;
+        return true;
+    }
+
+    const bool inverted =
+        g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+                NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    if (inverted) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+    if (g12.hdr) flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+    if (g_cfg.flags >= 0) flags = g_cfg.flags;
+
+    NVSDK_NGX_DLSS_Create_Params cp = {};
+    cp.Feature.InWidth = w;
+    cp.Feature.InHeight = h;
+    cp.Feature.InTargetWidth = w;
+    cp.Feature.InTargetHeight = h;
+    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.InFeatureCreateFlags = flags;
+    cp.InEnableOutputSubrects = false;
+
+    DWORD ccode = 0;
+    NVSDK_NGX_Result rf = SafeCreateDLSS12(list, &cp, &ccode);
+    if (ccode || NVSDK_NGX_FAILED(rf) || !g12.feature)
+    {
+        if (ccode) Warn("native D3D12 CreateFeature exception 0x%08X", ccode);
+        else Warn("native D3D12 CreateFeature failed 0x%08X (%s)", rf, NgxResultName(rf));
+        return false;
+    }
+
+    Log("[feed12] feature ready: %ux%u DLAA, color/output %s", w, h, FormatName(g12.color_fmt));
+    g12.feature_ready = true;
+    g12.need_reset = true;
+    g12.consecutive_fails = 0;
+    return true;
+}
+
+static ID3D12Resource *NativeResource12(reshade::api::device *dev_api, reshade::api::resource_view view)
+{
+    if (!dev_api || view.handle == 0) return nullptr;
+    const reshade::api::resource r = dev_api->get_resource_from_view(view);
+    return reinterpret_cast<ID3D12Resource *>(r.handle);
+}
+
+static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
+                           reshade::api::command_list *cl,
+                           reshade::api::resource_view rtv)
+{
+    if (!g_cfg.enabled || g12.disabled || g_cfg.mode == 0) return;
+
+    auto *dev_api = rt->get_device();
+    if (!dev_api || dev_api->get_api() != reshade::api::device_api::d3d12) return;
+
+    auto *dev12 = reinterpret_cast<ID3D12Device *>(dev_api->get_native());
+    auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(cl->get_native());
+    if (!dev12 || !list) return;
+
+    if ((g12.frames_done % 60) == 0 && CfgReload()) g12.feature_ready = false;
+
+    reshade::api::resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle) rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (!mv_srv.handle || !d_srv.handle) return;
+
+    auto *color = NativeResource12(dev_api, rtv);
+    auto *mv = NativeResource12(dev_api, mv_srv);
+    auto *depth = NativeResource12(dev_api, d_srv);
+    if (!color || !mv || !depth) return;
+
+    const auto cd = color->GetDesc();
+    const auto md = mv->GetDesc();
+    const auto dd = depth->GetDesc();
+
+    if (cd.Width != md.Width || cd.Height != md.Height ||
+        cd.Width != dd.Width || cd.Height != dd.Height ||
+        cd.SampleDesc.Count != 1 ||
+        md.Format != DXGI_FORMAT_R16G16_FLOAT ||
+        dd.Format != DXGI_FORMAT_R32_FLOAT)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[feed12] input mismatch: color %llux%u %s | mv %llux%u %s | depth %llux%u %s",
+                (unsigned long long)cd.Width, cd.Height, FormatName(cd.Format),
+                (unsigned long long)md.Width, md.Height, FormatName(md.Format),
+                (unsigned long long)dd.Width, dd.Height, FormatName(dd.Format));
+        }
+        return;
+    }
+
+    if (!InitSession12(dev12)) return;
+
+    if (!g12.feature_ready ||
+        g12.width != (UINT)cd.Width || g12.height != cd.Height ||
+        g12.color_fmt != TypedColorFormat(cd.Format))
+    {
+        if (!BuildResources12(list, (UINT)cd.Width, cd.Height, cd.Format))
+        {
+            if (++g12.consecutive_fails >= 3) g12.disabled = true;
+            return;
+        }
+    }
+
+    if (g_cfg.mode == 1)
+    {
+        ++g12.frames_done;
+        return;
+    }
+
+    // ReShade effect-runtime state assumptions after DLSS5_Feed:
+    // current color = RENDER_TARGET; DLSS5_MV/Depth = PIXEL_SHADER_RESOURCE.
+    BarrierOn(list, color, D3D12_RESOURCE_STATE_RENDER_TARGET,
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    BarrierOn(list, mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    BarrierOn(list, depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    BarrierOn(list, g12.output, D3D12_RESOURCE_STATE_COMMON,
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const int reset = (g12.need_reset || g_cfg.reset_every) ? 1 : 0;
+    g12.need_reset = false;
+
+    NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+    ep.Feature.pInColor = color;
+    ep.Feature.pInOutput = g12.output;
+    ep.pInDepth = depth;
+    ep.pInMotionVectors = mv;
+    ep.InJitterOffsetX = 0.0f;
+    ep.InJitterOffsetY = 0.0f;
+    ep.InRenderSubrectDimensions.Width = g12.width;
+    ep.InRenderSubrectDimensions.Height = g12.height;
+    ep.InReset = reset;
+    ep.InMVScaleX = g_cfg.mv_scale_x;
+    ep.InMVScaleY = g_cfg.mv_scale_y;
+    ep.InPreExposure = 1.0f;
+    ep.InExposureScale = 1.0f;
+
+    DWORD ecode = 0;
+    NVSDK_NGX_Result re = SafeEvaluateDLSS12(list, &ep, &ecode);
+
+    if (ecode || NVSDK_NGX_FAILED(re))
+    {
+        BarrierOn(list, g12.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                  D3D12_RESOURCE_STATE_COMMON);
+        BarrierOn(list, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        BarrierOn(list, mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        BarrierOn(list, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        g12.feature_ready = false;
+        g12.need_reset = true;
+        if (++g12.consecutive_fails >= 3) g12.disabled = true;
+        return;
+    }
+
+    BarrierOn(list, g12.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              D3D12_RESOURCE_STATE_COPY_SOURCE);
+    BarrierOn(list, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+              D3D12_RESOURCE_STATE_COPY_DEST);
+
+    list->CopyResource(color, g12.output);
+
+    BarrierOn(list, color, D3D12_RESOURCE_STATE_COPY_DEST,
+              D3D12_RESOURCE_STATE_RENDER_TARGET);
+    BarrierOn(list, g12.output, D3D12_RESOURCE_STATE_COPY_SOURCE,
+              D3D12_RESOURCE_STATE_COMMON);
+    BarrierOn(list, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    BarrierOn(list, mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    const UINT64 n = ++g12.frames_done;
+    g12.consecutive_fails = 0;
+    if (n <= (UINT64)g_cfg.log_frames || (n % 1800) == 0)
+        Log("[feed12] frame %llu delivered (%ux%u reset=%d)", n, g12.width, g12.height, reset);
+
+    if (g_cfg.warmup_rebuild > 0 && n == (UINT64)g_cfg.warmup_rebuild)
+    {
+        g12.feature_ready = false;
+        g12.need_reset = true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per frame
 // ---------------------------------------------------------------------------
@@ -948,7 +1327,7 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
     return tex;  // caller releases
 }
 
-static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+static void FeedFrameD3D11(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
 
@@ -957,10 +1336,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
 
     reshade::api::device *dev_api = rt->get_device();
     if (dev_api->get_api() != reshade::api::device_api::d3d11)
-    {
-        FeedDisable("only Direct3D 11 games are supported");
         return;
-    }
 
     auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
@@ -1204,7 +1580,13 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
-    if (rt == g.runtime || g.runtime == nullptr) { g.runtime = rt; ResolveHandles(rt); }
+    if (rt == g.runtime || g.runtime == nullptr)
+    {
+        g.runtime = rt;
+        ResolveHandles(rt);
+        g12.feature_ready = false;
+        g12.need_reset = true;
+    }
 }
 
 static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,
@@ -1212,15 +1594,32 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::resource_view /*rtv_srgb*/)
 {
     if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
-    FeedFrame(rt, cl, rtv);
+    reshade::api::device *dev = rt->get_device();
+    if (dev == nullptr) return;
+    if (dev->get_api() == reshade::api::device_api::d3d11)
+        FeedFrameD3D11(rt, cl, rtv);
+    else if (dev->get_api() == reshade::api::device_api::d3d12)
+        FeedFrameD3D12(rt, cl, rtv);
 }
 
 static void OnDestroyDevice(reshade::api::device *dev)
 {
-    if (g.dev11 != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev11)
+    if (dev == nullptr) return;
+
+    if (dev->get_api() == reshade::api::device_api::d3d11 &&
+        g.dev11 != nullptr &&
+        reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev11)
     {
         Log("[feed] D3D11 device destroyed; shutting the session down");
         ShutdownSession();
+    }
+
+    if (dev->get_api() == reshade::api::device_api::d3d12 &&
+        g12.dev != nullptr &&
+        reinterpret_cast<ID3D12Device *>(dev->get_native()) == g12.dev)
+    {
+        Log("[feed12] D3D12 device destroyed; shutting native session down");
+        ShutdownSession12();
     }
 }
 

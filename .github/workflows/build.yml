@@ -1,0 +1,126 @@
+name: Build DLSS5 Feeder
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch NVIDIA DLSS SDK files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          git clone --depth 1 https://github.com/NVIDIA/DLSS.git "$env:RUNNER_TEMP\DLSS"
+
+          $ngx = "external\ngx"
+          $libs = Join-Path $ngx "libs"
+          New-Item -ItemType Directory -Force -Path $ngx | Out-Null
+          New-Item -ItemType Directory -Force -Path $libs | Out-Null
+
+          $headers = @(
+            "nvsdk_ngx.h",
+            "nvsdk_ngx_defs.h",
+            "nvsdk_ngx_defs_dlssd.h",
+            "nvsdk_ngx_helpers.h",
+            "nvsdk_ngx_helpers_dlssd.h",
+            "nvsdk_ngx_params.h",
+            "nvsdk_ngx_params_dlssd.h"
+          )
+
+          foreach ($header in $headers) {
+            $src = Join-Path "$env:RUNNER_TEMP\DLSS\include" $header
+            if (-not (Test-Path $src)) {
+              throw "Missing NGX header: $src"
+            }
+            Copy-Item $src (Join-Path $ngx $header) -Force
+          }
+
+          $libCandidates = @(
+            "$env:RUNNER_TEMP\DLSS\lib\Windows_x86_64\x64\nvsdk_ngx_d.lib",
+            "$env:RUNNER_TEMP\DLSS\lib\Windows_x86_64\nvsdk_ngx_d.lib"
+          )
+
+          $lib = $libCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $lib) {
+            Write-Host "Contents of DLSS Windows library directory:"
+            Get-ChildItem "$env:RUNNER_TEMP\DLSS\lib\Windows_x86_64" -Recurse |
+              Select-Object FullName
+            throw "Could not find nvsdk_ngx_d.lib in NVIDIA/DLSS."
+          }
+
+          Copy-Item $lib "$libs\nvsdk_ngx_d.lib" -Force
+
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL (
+            echo Could not locate Visual Studio C++ Build Tools.
+            exit /b 1
+          )
+
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+
+          if not exist build mkdir build
+
+          rc /nologo /fo build\version.res src\version.rc
+          if errorlevel 1 exit /b %errorlevel%
+
+          cl /nologo /LD /EHsc /O2 /MD /W3 /std:c++20 ^
+            /Iexternal\reshade\include ^
+            /Iexternal\ngx ^
+            /Fobuild\ ^
+            /Fdbuild\ ^
+            src\dlss5-feed.cpp ^
+            /link ^
+            /OUT:build\dlss5-feed.addon64 ^
+            build\version.res ^
+            external\ngx\libs\nvsdk_ngx_d.lib ^
+            kernel32.lib ^
+            user32.lib ^
+            advapi32.lib ^
+            ole32.lib
+
+          if errorlevel 1 exit /b %errorlevel%
+
+          if not exist build\dlss5-feed.addon64 (
+            echo Build completed without producing build\dlss5-feed.addon64
+            exit /b 1
+          )
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "artifact" | Out-Null
+
+          Copy-Item "build\dlss5-feed.addon64" "artifact\dlss5-feed.addon64"
+
+          if (Test-Path "shaders\DLSS5_Feed.fx") {
+            Copy-Item "shaders\DLSS5_Feed.fx" "artifact\DLSS5_Feed.fx"
+          }
+
+          if (Test-Path "README.md") {
+            Copy-Item "README.md" "artifact\README.md"
+          }
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLSS5-Feeder-${{ github.sha }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
