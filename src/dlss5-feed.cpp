@@ -38,7 +38,7 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.2.3-dx12-barrier-diag"
+#define FEED_VERSION "0.2.4-dx12-lifetime"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -205,9 +205,10 @@ static bool CfgReload()
     fclose(f);
     if (next.mode < 0 || next.mode > 4) next.mode = g_cfg.mode;
 
+    // Modes 2/3/4 use the same native D3D12 feature contract.
+    // Only crossing the no-feature/feature boundary requires recreation.
     const bool mode_rebuild =
-        next.mode != g_cfg.mode &&
-        ((next.mode >= 2) || (g_cfg.mode >= 2));
+        (next.mode >= 2) != (g_cfg.mode >= 2);
 
     const bool rebuild =
         next.hdr != g_cfg.hdr ||
@@ -991,6 +992,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
 // DX12_STAGED_INPUTS_PATCH
 // DX12_DIAGNOSTIC_MODES_PATCH
 // DX12_BARRIER_DIAGNOSTIC_PATCH
+// DX12_LIFETIME_STABILITY_PATCH
 //
 // This revision stages ReShade COLOR/MV/Depth into feeder-owned resources.
 // NGX never receives a ReShade-owned resource.
@@ -1336,6 +1338,24 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
 
     if (need_resources || need_feature)
     {
+        const bool size_changed =
+            g12.width != 0 &&
+            (g12.width != (UINT)cd.Width || g12.height != cd.Height);
+        const bool format_changed =
+            g12.color_fmt != DXGI_FORMAT_UNKNOWN &&
+            g12.color_fmt != typed_color;
+        const bool resources_missing =
+            g12.tex[SLOT_COLOR] == nullptr ||
+            g12.tex[SLOT_OUTPUT] == nullptr ||
+            g12.tex[SLOT_DEPTH] == nullptr ||
+            g12.tex[SLOT_MV] == nullptr;
+
+        Log("[feed12] rebuild reason:%s%s%s%s",
+            size_changed ? " resolution" : "",
+            format_changed ? " format" : "",
+            resources_missing ? " resources-missing" : "",
+            need_feature && !need_resources ? " feature-not-ready" : "");
+
         Log("[feed12] source descriptors: color=%llux%u %s flags=0x%X | mv=%llux%u %s flags=0x%X | depth=%llux%u %s flags=0x%X",
             (unsigned long long)cd.Width, cd.Height, FormatName(cd.Format), (unsigned)cd.Flags,
             (unsigned long long)md.Width, md.Height, FormatName(md.Format), (unsigned)md.Flags,
@@ -1540,11 +1560,9 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
         Log("[feed12] staged frame %llu delivered (%ux%u reset=%d)",
             n, g12.width, g12.height, reset);
 
-    if (g_cfg.warmup_rebuild > 0 && n == (UINT64)g_cfg.warmup_rebuild)
-    {
-        g12.feature_ready = false;
-        g12.need_reset = true;
-    }
+    // Native D3D12: do not force a warm-up feature rebuild. Evaluate work is
+    // recorded on the game's/ReShade's command list and may still reference the
+    // feature/resources asynchronously. warmup_rebuild remains a legacy D3D11 option.
 }
 
 // ---------------------------------------------------------------------------
@@ -1839,8 +1857,13 @@ static void OnReloadedEffects(reshade::api::effect_runtime *rt)
     {
         g.runtime = rt;
         ResolveHandles(rt);
-        g12.feature_ready = false;
-        g12.need_reset = true;
+
+        // Effect recompilation does not invalidate the D3D12 device or our
+        // feeder-owned resources. Keep the NGX feature alive so we do not
+        // release/recreate it while previously recorded Evaluate work is in flight.
+        if (g12.feature_ready && g12.feature != nullptr)
+            Log("[feed12] effects reloaded; preserving native D3D12 feature=%p (%ux%u %s)",
+                g12.feature, g12.width, g12.height, FormatName(g12.color_fmt));
     }
 }
 
