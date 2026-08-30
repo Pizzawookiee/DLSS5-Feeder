@@ -38,7 +38,7 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.2.5-dx12-eval-nocopy"
+#define FEED_VERSION "0.2.6-dx12-blit-diag"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -203,7 +203,7 @@ static bool CfgReload()
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
     fclose(f);
-    if (next.mode < 0 || next.mode > 5) next.mode = g_cfg.mode;
+    if (next.mode < 0 || next.mode > 6) next.mode = g_cfg.mode;
 
     // Modes 2/3/4 use the same native D3D12 feature contract.
     // Only crossing the no-feature/feature boundary requires recreation.
@@ -319,6 +319,12 @@ struct Feed12
     bool need_reset;
     bool disabled;
     int consecutive_fails;
+    
+    ID3D12RootSignature  *blit_root;
+    ID3D12PipelineState  *blit_pso;
+    ID3D12DescriptorHeap *blit_srv_heap;
+    ID3D12DescriptorHeap *blit_rtv_heap;
+    DXGI_FORMAT           blit_fmt;
     UINT64 frames_done;
 };
 
@@ -1000,6 +1006,12 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
 
 static void ReleaseFrameResources12()
 {
+    SafeRelease(g12.blit_pso);
+    SafeRelease(g12.blit_root);
+    SafeRelease(g12.blit_srv_heap);
+    SafeRelease(g12.blit_rtv_heap);
+    g12.blit_fmt = DXGI_FORMAT_UNKNOWN;
+
     if (g12.feature)
     {
         NVSDK_NGX_D3D12_ReleaseFeature(g12.feature);
@@ -1267,6 +1279,201 @@ static bool StageInputs12(ID3D12GraphicsCommandList *list,
     return true;
 }
 
+
+static bool EnsureBlit12(ID3D12Resource *color)
+{
+    if (!g12.dev || !color || !g12.tex[SLOT_OUTPUT])
+        return false;
+
+    if (g12.blit_root && g12.blit_pso && g12.blit_srv_heap && g12.blit_rtv_heap &&
+        g12.blit_fmt == g12.color_fmt)
+    {
+        g12.dev->CreateRenderTargetView(color, nullptr,
+            g12.blit_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+        return true;
+    }
+
+    SafeRelease(g12.blit_pso);
+    SafeRelease(g12.blit_root);
+    SafeRelease(g12.blit_srv_heap);
+    SafeRelease(g12.blit_rtv_heap);
+    g12.blit_fmt = DXGI_FORMAT_UNKNOWN;
+
+    D3D12_DESCRIPTOR_RANGE range = {};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    range.BaseShaderRegister = 0;
+
+    D3D12_ROOT_PARAMETER param = {};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable.NumDescriptorRanges = 1;
+    param.DescriptorTable.pDescriptorRanges = &range;
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.NumParameters = 1;
+    rsd.pParameters = &param;
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ID3DBlob *sig = nullptr, *err = nullptr;
+    HRESULT hr = D3D12SerializeRootSignature(
+        &rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+    if (FAILED(hr) || !sig)
+    {
+        if (err) Log("[feed12] blit root serialize failed: %s",
+                     (const char *)err->GetBufferPointer());
+        SafeRelease(err); SafeRelease(sig);
+        return false;
+    }
+
+    hr = g12.dev->CreateRootSignature(
+        0, sig->GetBufferPointer(), sig->GetBufferSize(),
+        __uuidof(ID3D12RootSignature),
+        reinterpret_cast<void **>(&g12.blit_root));
+    SafeRelease(sig); SafeRelease(err);
+    if (FAILED(hr) || !g12.blit_root)
+    {
+        Log("[feed12] CreateRootSignature(blit) failed 0x%08X", hr);
+        return false;
+    }
+
+    static const char *vs_src =
+        "struct O{float4 p:SV_Position;};"
+        "O main(uint id:SV_VertexID){"
+        "float2 p=float2((id<<1)&2,id&2);"
+        "O o;o.p=float4(p*float2(2,-2)+float2(-1,1),0,1);return o;}";
+
+    static const char *ps_src =
+        "Texture2D<float4> src:register(t0);"
+        "float4 main(float4 p:SV_Position):SV_Target{"
+        "return src.Load(int3(int2(p.xy),0));}";
+
+    ID3DBlob *vs = nullptr, *ps = nullptr;
+    hr = D3DCompile(vs_src, strlen(vs_src), nullptr, nullptr, nullptr,
+                    "main", "vs_5_0", 0, 0, &vs, &err);
+    if (FAILED(hr) || !vs)
+    {
+        if (err) Log("[feed12] blit VS compile failed: %s",
+                     (const char *)err->GetBufferPointer());
+        SafeRelease(err); SafeRelease(vs);
+        return false;
+    }
+    SafeRelease(err);
+
+    hr = D3DCompile(ps_src, strlen(ps_src), nullptr, nullptr, nullptr,
+                    "main", "ps_5_0", 0, 0, &ps, &err);
+    if (FAILED(hr) || !ps)
+    {
+        if (err) Log("[feed12] blit PS compile failed: %s",
+                     (const char *)err->GetBufferPointer());
+        SafeRelease(err); SafeRelease(vs); SafeRelease(ps);
+        return false;
+    }
+    SafeRelease(err);
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = g12.blit_root;
+    pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.DepthStencilState.DepthEnable = FALSE;
+    pd.DepthStencilState.StencilEnable = FALSE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = g12.color_fmt;
+    pd.SampleDesc.Count = 1;
+
+    hr = g12.dev->CreateGraphicsPipelineState(
+        &pd, __uuidof(ID3D12PipelineState),
+        reinterpret_cast<void **>(&g12.blit_pso));
+    SafeRelease(vs); SafeRelease(ps);
+    if (FAILED(hr) || !g12.blit_pso)
+    {
+        Log("[feed12] CreateGraphicsPipelineState(blit) failed 0x%08X", hr);
+        return false;
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC sh = {};
+    sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    sh.NumDescriptors = 1;
+    sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = g12.dev->CreateDescriptorHeap(
+        &sh, __uuidof(ID3D12DescriptorHeap),
+        reinterpret_cast<void **>(&g12.blit_srv_heap));
+    if (FAILED(hr) || !g12.blit_srv_heap)
+        return false;
+
+    D3D12_DESCRIPTOR_HEAP_DESC rh = {};
+    rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rh.NumDescriptors = 1;
+    hr = g12.dev->CreateDescriptorHeap(
+        &rh, __uuidof(ID3D12DescriptorHeap),
+        reinterpret_cast<void **>(&g12.blit_rtv_heap));
+    if (FAILED(hr) || !g12.blit_rtv_heap)
+        return false;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Format = g12.output_fmt;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    g12.dev->CreateShaderResourceView(
+        g12.tex[SLOT_OUTPUT], &sd,
+        g12.blit_srv_heap->GetCPUDescriptorHandleForHeapStart());
+
+    g12.dev->CreateRenderTargetView(
+        color, nullptr,
+        g12.blit_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+
+    g12.blit_fmt = g12.color_fmt;
+    Log("[feed12] fullscreen D3D12 blit pipeline ready (%s)",
+        FormatName(g12.blit_fmt));
+    return true;
+}
+
+static bool BlitOutput12(ID3D12GraphicsCommandList *list, ID3D12Resource *color)
+{
+    if (!list || !EnsureBlit12(color))
+        return false;
+
+    BarrierOn(list, g12.tex[SLOT_OUTPUT],
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    D3D12_VIEWPORT vp = {};
+    vp.Width = static_cast<float>(g12.width);
+    vp.Height = static_cast<float>(g12.height);
+    vp.MaxDepth = 1.0f;
+
+    D3D12_RECT sc = {};
+    sc.right = static_cast<LONG>(g12.width);
+    sc.bottom = static_cast<LONG>(g12.height);
+
+    ID3D12DescriptorHeap *heaps[] = { g12.blit_srv_heap };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetGraphicsRootSignature(g12.blit_root);
+    list->SetPipelineState(g12.blit_pso);
+    list->SetGraphicsRootDescriptorTable(
+        0, g12.blit_srv_heap->GetGPUDescriptorHandleForHeapStart());
+    list->RSSetViewports(1, &vp);
+    list->RSSetScissorRects(1, &sc);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvh =
+        g12.blit_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    list->OMSetRenderTargets(1, &rtvh, FALSE, nullptr);
+    list->DrawInstanced(3, 1, 0, 0);
+
+    BarrierOn(list, g12.tex[SLOT_OUTPUT],
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+              D3D12_RESOURCE_STATE_COMMON);
+    return true;
+}
+
 static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
                            reshade::api::command_list *cl,
                            reshade::api::resource_view rtv)
@@ -1394,7 +1601,7 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
     }
 
     // modes 3 and 4 exercise the feeder-owned NGX resource transitions.
-    if (g_cfg.mode != 3 && g_cfg.mode != 4 && g_cfg.mode != 5)
+    if (g_cfg.mode != 3 && g_cfg.mode != 4 && g_cfg.mode != 5 && g_cfg.mode != 6)
     {
         Breadcrumb("idle");
         return;
@@ -1542,6 +1749,35 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
 
         if (n <= 10 || (n % 600) == 0)
             Log("[feed12] evaluate-no-copy frame %llu completed (%ux%u reset=%d)",
+                n, g12.width, g12.height, reset);
+
+        return;
+    }
+
+
+    if (g_cfg.mode == 6)
+    {
+        if (eval_index <= 10)
+            Log("[feed12] frame %llu evaluate succeeded; beginning fullscreen blit",
+                eval_index);
+
+        Breadcrumb("DX12: fullscreen blit");
+
+        if (!BlitOutput12(list, color))
+        {
+            Log("[feed12] fullscreen blit setup/draw failed");
+            BarrierOn(list, g12.tex[SLOT_OUTPUT],
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      D3D12_RESOURCE_STATE_COMMON);
+            return;
+        }
+
+        const UINT64 n = ++g12.frames_done;
+        g12.consecutive_fails = 0;
+        Breadcrumb("idle");
+
+        if (n <= 10 || (n % 600) == 0)
+            Log("[feed12] fullscreen-blit frame %llu delivered (%ux%u reset=%d)",
                 n, g12.width, g12.height, reset);
 
         return;
