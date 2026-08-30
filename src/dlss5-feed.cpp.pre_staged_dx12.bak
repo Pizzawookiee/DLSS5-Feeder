@@ -38,7 +38,7 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.2.1-dx12-staged"
+#define FEED_VERSION "0.2.0-dx12"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -294,13 +294,12 @@ struct Feed
 static Feed g;
 
 // DX12_NATIVE_FEED_PATCH
-// DX12_STAGED_INPUTS_PATCH
 struct Feed12
 {
-    ID3D12Device        *dev;
+    ID3D12Device        *dev;       // borrowed from ReShade/game
     NVSDK_NGX_Parameter *params;
     NVSDK_NGX_Handle    *feature;
-    ID3D12Resource      *tex[SLOT_COUNT];
+    ID3D12Resource      *output;
 
     UINT width, height;
     DXGI_FORMAT color_fmt, output_fmt;
@@ -980,11 +979,6 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
 // Native D3D12 host path
 // ---------------------------------------------------------------------------
 // DX12_NATIVE_FEED_PATCH
-// DX12_STAGED_INPUTS_PATCH
-//
-// This revision stages ReShade COLOR/MV/Depth into feeder-owned resources.
-// NGX never receives a ReShade-owned resource.
-// mode=1 performs staging copies only, making it a real barrier/copy test.
 
 static void ReleaseFrameResources12()
 {
@@ -993,10 +987,7 @@ static void ReleaseFrameResources12()
         NVSDK_NGX_D3D12_ReleaseFeature(g12.feature);
         g12.feature = nullptr;
     }
-
-    for (int i = 0; i < SLOT_COUNT; ++i)
-        SafeRelease(g12.tex[i]);
-
+    SafeRelease(g12.output);
     g12.feature_ready = false;
     g12.width = g12.height = 0;
     g12.color_fmt = g12.output_fmt = DXGI_FORMAT_UNKNOWN;
@@ -1005,19 +996,16 @@ static void ReleaseFrameResources12()
 static void ShutdownSession12()
 {
     ReleaseFrameResources12();
-
     if (g12.params)
     {
         NVSDK_NGX_D3D12_DestroyParameters(g12.params);
         g12.params = nullptr;
     }
-
     if (g12.ngx_inited && g12.dev)
     {
         NVSDK_NGX_D3D12_Shutdown1(g12.dev);
         g12.ngx_inited = false;
     }
-
     g12.dev = nullptr;
 }
 
@@ -1025,28 +1013,24 @@ static bool InitSession12(ID3D12Device *dev)
 {
     if (!dev) return false;
     if (g12.dev == dev && g12.ngx_inited && g12.params) return true;
-
-    if (g12.dev && g12.dev != dev)
-        ShutdownSession12();
+    if (g12.dev && g12.dev != dev) ShutdownSession12();
 
     Log("################ feed: opening native D3D12 session ################");
     g12.dev = dev;
 
     wchar_t data_path[MAX_PATH] = {};
     GetModuleFileNameW(g_self, data_path, MAX_PATH);
-    if (wchar_t *s = wcsrchr(data_path, L'\\'))
-        *(s + 1) = L'\0';
+    if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(
-        0x1000000ULL, data_path, g12.dev, nullptr, NVSDK_NGX_Version_API);
+    NVSDK_NGX_Result r =
+        NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g12.dev, nullptr, NVSDK_NGX_Version_API);
     Log("[feed12] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
 
     if (NVSDK_NGX_FAILED(r))
     {
         r = NVSDK_NGX_D3D12_Init_with_ProjectID(
             "a0f57b54-1daf-4934-90ae-c4035c19df04",
-            NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0",
-            data_path, g12.dev, nullptr, NVSDK_NGX_Version_API);
+            NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", data_path, g12.dev, nullptr, NVSDK_NGX_Version_API);
         Log("[feed12] Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
     }
 
@@ -1070,41 +1054,8 @@ static bool InitSession12(ID3D12Device *dev)
     return true;
 }
 
-static bool MakeOwnedTexture12(int slot, UINT w, UINT h, DXGI_FORMAT fmt, D3D12_RESOURCE_FLAGS flags)
-{
-    D3D12_HEAP_PROPERTIES hp = {};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = w;
-    rd.Height = h;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.Format = fmt;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    rd.Flags = flags;
-
-    HRESULT hr = g12.dev->CreateCommittedResource(
-        &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
-        nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g12.tex[slot]));
-
-    if (FAILED(hr) || !g12.tex[slot])
-    {
-        Log("[feed12] CreateCommittedResource(%s %ux%u %s flags=0x%X) failed 0x%08X",
-            kSlotName[slot], w, h, FormatName(fmt), (unsigned)flags, hr);
-        return false;
-    }
-
-    Log("[feed12] owned %-6s %ux%u %s flags=0x%X",
-        kSlotName[slot], w, h, FormatName(fmt), (unsigned)flags);
-    return true;
-}
-
 static bool BuildResources12(ID3D12GraphicsCommandList *list, UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
-    if (!list || !g12.dev) return false;
     ReleaseFrameResources12();
 
     g12.width = w;
@@ -1121,20 +1072,32 @@ static bool BuildResources12(ID3D12GraphicsCommandList *list, UINT w, UINT h, DX
 
     if (g12.output_fmt != g12.color_fmt)
     {
-        Warn("native D3D12: target %s requires output %s; format-conversion copy-back is not implemented yet",
+        Warn("native D3D12: %s requires output %s; format-conversion copy-back is not implemented yet",
              FormatName(g12.color_fmt), FormatName(g12.output_fmt));
         return false;
     }
 
-    bool ok =
-        MakeOwnedTexture12(SLOT_COLOR,  w, h, g12.color_fmt, D3D12_RESOURCE_FLAG_NONE) &&
-        MakeOwnedTexture12(SLOT_OUTPUT, w, h, g12.output_fmt, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
-        MakeOwnedTexture12(SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE) &&
-        MakeOwnedTexture12(SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-    if (!ok)
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w;
+    rd.Height = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = g12.output_fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    HRESULT hr = g12.dev->CreateCommittedResource(
+        &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
+        nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g12.output));
+
+    if (FAILED(hr) || !g12.output)
     {
-        ReleaseFrameResources12();
+        Warn("native D3D12: output creation failed 0x%08X", hr);
         return false;
     }
 
@@ -1142,7 +1105,6 @@ static bool BuildResources12(ID3D12GraphicsCommandList *list, UINT w, UINT h, DX
     {
         g12.feature_ready = true;
         g12.need_reset = true;
-        Log("[feed12] staging resources ready (mode=%d, NGX feature not created)", g_cfg.mode);
         return true;
     }
 
@@ -1166,19 +1128,14 @@ static bool BuildResources12(ID3D12GraphicsCommandList *list, UINT w, UINT h, DX
 
     DWORD ccode = 0;
     NVSDK_NGX_Result rf = SafeCreateDLSS12(list, &cp, &ccode);
-
     if (ccode || NVSDK_NGX_FAILED(rf) || !g12.feature)
     {
-        if (ccode)
-            Warn("native D3D12 CreateFeature exception 0x%08X", ccode);
-        else
-            Warn("native D3D12 CreateFeature failed 0x%08X (%s)", rf, NgxResultName(rf));
+        if (ccode) Warn("native D3D12 CreateFeature exception 0x%08X", ccode);
+        else Warn("native D3D12 CreateFeature failed 0x%08X (%s)", rf, NgxResultName(rf));
         return false;
     }
 
-    Log("[feed12] feature ready: %ux%u DLAA, owned color/output %s, depth R32_FLOAT, mv R16G16_FLOAT",
-        w, h, FormatName(g12.color_fmt));
-
+    Log("[feed12] feature ready: %ux%u DLAA, color/output %s", w, h, FormatName(g12.color_fmt));
     g12.feature_ready = true;
     g12.need_reset = true;
     g12.consecutive_fails = 0;
@@ -1190,60 +1147,6 @@ static ID3D12Resource *NativeResource12(reshade::api::device *dev_api, reshade::
     if (!dev_api || view.handle == 0) return nullptr;
     const reshade::api::resource r = dev_api->get_resource_from_view(view);
     return reinterpret_cast<ID3D12Resource *>(r.handle);
-}
-
-static bool StageInputs12(ID3D12GraphicsCommandList *list,
-                          ID3D12Resource *color,
-                          ID3D12Resource *mv,
-                          ID3D12Resource *depth)
-{
-    if (!list || !color || !mv || !depth) return false;
-
-    BarrierOn(list, color,
-              D3D12_RESOURCE_STATE_RENDER_TARGET,
-              D3D12_RESOURCE_STATE_COPY_SOURCE);
-    BarrierOn(list, mv,
-              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-              D3D12_RESOURCE_STATE_COPY_SOURCE);
-    BarrierOn(list, depth,
-              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-              D3D12_RESOURCE_STATE_COPY_SOURCE);
-
-    BarrierOn(list, g12.tex[SLOT_COLOR],
-              D3D12_RESOURCE_STATE_COMMON,
-              D3D12_RESOURCE_STATE_COPY_DEST);
-    BarrierOn(list, g12.tex[SLOT_MV],
-              D3D12_RESOURCE_STATE_COMMON,
-              D3D12_RESOURCE_STATE_COPY_DEST);
-    BarrierOn(list, g12.tex[SLOT_DEPTH],
-              D3D12_RESOURCE_STATE_COMMON,
-              D3D12_RESOURCE_STATE_COPY_DEST);
-
-    list->CopyResource(g12.tex[SLOT_COLOR], color);
-    list->CopyResource(g12.tex[SLOT_MV], mv);
-    list->CopyResource(g12.tex[SLOT_DEPTH], depth);
-
-    BarrierOn(list, color,
-              D3D12_RESOURCE_STATE_COPY_SOURCE,
-              D3D12_RESOURCE_STATE_RENDER_TARGET);
-    BarrierOn(list, mv,
-              D3D12_RESOURCE_STATE_COPY_SOURCE,
-              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    BarrierOn(list, depth,
-              D3D12_RESOURCE_STATE_COPY_SOURCE,
-              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-
-    BarrierOn(list, g12.tex[SLOT_COLOR],
-              D3D12_RESOURCE_STATE_COPY_DEST,
-              D3D12_RESOURCE_STATE_COMMON);
-    BarrierOn(list, g12.tex[SLOT_MV],
-              D3D12_RESOURCE_STATE_COPY_DEST,
-              D3D12_RESOURCE_STATE_COMMON);
-    BarrierOn(list, g12.tex[SLOT_DEPTH],
-              D3D12_RESOURCE_STATE_COPY_DEST,
-              D3D12_RESOURCE_STATE_COMMON);
-
-    return true;
 }
 
 static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
@@ -1259,8 +1162,7 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
     auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(cl->get_native());
     if (!dev12 || !list) return;
 
-    if ((g12.frames_done % 60) == 0 && CfgReload())
-        g12.feature_ready = false;
+    if ((g12.frames_done % 60) == 0 && CfgReload()) g12.feature_ready = false;
 
     reshade::api::resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
     if (g.mv_var.handle) rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
@@ -1286,28 +1188,20 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
         if (!said)
         {
             said = true;
-            Log("[feed12] input mismatch: color %llux%u %s flags=0x%X | mv %llux%u %s flags=0x%X | depth %llux%u %s flags=0x%X",
-                (unsigned long long)cd.Width, cd.Height, FormatName(cd.Format), (unsigned)cd.Flags,
-                (unsigned long long)md.Width, md.Height, FormatName(md.Format), (unsigned)md.Flags,
-                (unsigned long long)dd.Width, dd.Height, FormatName(dd.Format), (unsigned)dd.Flags);
+            Log("[feed12] input mismatch: color %llux%u %s | mv %llux%u %s | depth %llux%u %s",
+                (unsigned long long)cd.Width, cd.Height, FormatName(cd.Format),
+                (unsigned long long)md.Width, md.Height, FormatName(md.Format),
+                (unsigned long long)dd.Width, dd.Height, FormatName(dd.Format));
         }
         return;
     }
 
     if (!InitSession12(dev12)) return;
 
-    const DXGI_FORMAT typed_color = TypedColorFormat(cd.Format);
-
     if (!g12.feature_ready ||
-        g12.width != (UINT)cd.Width ||
-        g12.height != cd.Height ||
-        g12.color_fmt != typed_color)
+        g12.width != (UINT)cd.Width || g12.height != cd.Height ||
+        g12.color_fmt != TypedColorFormat(cd.Format))
     {
-        Log("[feed12] source descriptors: color=%llux%u %s flags=0x%X | mv=%llux%u %s flags=0x%X | depth=%llux%u %s flags=0x%X",
-            (unsigned long long)cd.Width, cd.Height, FormatName(cd.Format), (unsigned)cd.Flags,
-            (unsigned long long)md.Width, md.Height, FormatName(md.Format), (unsigned)md.Flags,
-            (unsigned long long)dd.Width, dd.Height, FormatName(dd.Format), (unsigned)dd.Flags);
-
         if (!BuildResources12(list, (UINT)cd.Width, cd.Height, cd.Format))
         {
             if (++g12.consecutive_fails >= 3) g12.disabled = true;
@@ -1315,42 +1209,31 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
         }
     }
 
-    if (!StageInputs12(list, color, mv, depth))
-        return;
-
-    // mode=1 is now a real staging/barrier test.
     if (g_cfg.mode == 1)
     {
-        const UINT64 n = ++g12.frames_done;
-        g12.consecutive_fails = 0;
-        if (n <= (UINT64)g_cfg.log_frames)
-            Log("[feed12] staging-only frame %llu completed", n);
+        ++g12.frames_done;
         return;
     }
 
-    // From here onward every resource is feeder-owned.
-    BarrierOn(list, g12.tex[SLOT_COLOR],
-              D3D12_RESOURCE_STATE_COMMON,
+    // ReShade effect-runtime state assumptions after DLSS5_Feed:
+    // current color = RENDER_TARGET; DLSS5_MV/Depth = PIXEL_SHADER_RESOURCE.
+    BarrierOn(list, color, D3D12_RESOURCE_STATE_RENDER_TARGET,
               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    BarrierOn(list, g12.tex[SLOT_MV],
-              D3D12_RESOURCE_STATE_COMMON,
+    BarrierOn(list, mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    BarrierOn(list, g12.tex[SLOT_DEPTH],
-              D3D12_RESOURCE_STATE_COMMON,
+    BarrierOn(list, depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    BarrierOn(list, g12.tex[SLOT_OUTPUT],
-              D3D12_RESOURCE_STATE_COMMON,
+    BarrierOn(list, g12.output, D3D12_RESOURCE_STATE_COMMON,
               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     const int reset = (g12.need_reset || g_cfg.reset_every) ? 1 : 0;
     g12.need_reset = false;
 
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
-    ep.Feature.pInColor = g12.tex[SLOT_COLOR];
-    ep.Feature.pInOutput = g12.tex[SLOT_OUTPUT];
-    ep.Feature.InSharpness = 0.0f;
-    ep.pInDepth = g12.tex[SLOT_DEPTH];
-    ep.pInMotionVectors = g12.tex[SLOT_MV];
+    ep.Feature.pInColor = color;
+    ep.Feature.pInOutput = g12.output;
+    ep.pInDepth = depth;
+    ep.pInMotionVectors = mv;
     ep.InJitterOffsetX = 0.0f;
     ep.InJitterOffsetY = 0.0f;
     ep.InRenderSubrectDimensions.Width = g12.width;
@@ -1366,15 +1249,14 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
 
     if (ecode || NVSDK_NGX_FAILED(re))
     {
-        if (ecode)
-            Log("[feed12] evaluate exception 0x%08X", ecode);
-        else
-            Log("[feed12] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
-
-        BarrierOn(list, g12.tex[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-        BarrierOn(list, g12.tex[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-        BarrierOn(list, g12.tex[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-        BarrierOn(list, g12.tex[SLOT_COLOR], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        BarrierOn(list, g12.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                  D3D12_RESOURCE_STATE_COMMON);
+        BarrierOn(list, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        BarrierOn(list, mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        BarrierOn(list, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_RENDER_TARGET);
 
         g12.feature_ready = false;
         g12.need_reset = true;
@@ -1382,32 +1264,26 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
         return;
     }
 
-    BarrierOn(list, g12.tex[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    BarrierOn(list, g12.tex[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    BarrierOn(list, g12.tex[SLOT_COLOR], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-
-    BarrierOn(list, g12.tex[SLOT_OUTPUT],
-              D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    BarrierOn(list, g12.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
               D3D12_RESOURCE_STATE_COPY_SOURCE);
-    BarrierOn(list, color,
-              D3D12_RESOURCE_STATE_RENDER_TARGET,
+    BarrierOn(list, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
               D3D12_RESOURCE_STATE_COPY_DEST);
 
-    list->CopyResource(color, g12.tex[SLOT_OUTPUT]);
+    list->CopyResource(color, g12.output);
 
-    BarrierOn(list, color,
-              D3D12_RESOURCE_STATE_COPY_DEST,
+    BarrierOn(list, color, D3D12_RESOURCE_STATE_COPY_DEST,
               D3D12_RESOURCE_STATE_RENDER_TARGET);
-    BarrierOn(list, g12.tex[SLOT_OUTPUT],
-              D3D12_RESOURCE_STATE_COPY_SOURCE,
+    BarrierOn(list, g12.output, D3D12_RESOURCE_STATE_COPY_SOURCE,
               D3D12_RESOURCE_STATE_COMMON);
+    BarrierOn(list, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    BarrierOn(list, mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     const UINT64 n = ++g12.frames_done;
     g12.consecutive_fails = 0;
-
     if (n <= (UINT64)g_cfg.log_frames || (n % 1800) == 0)
-        Log("[feed12] staged frame %llu delivered (%ux%u reset=%d)",
-            n, g12.width, g12.height, reset);
+        Log("[feed12] frame %llu delivered (%ux%u reset=%d)", n, g12.width, g12.height, reset);
 
     if (g_cfg.warmup_rebuild > 0 && n == (UINT64)g_cfg.warmup_rebuild)
     {
