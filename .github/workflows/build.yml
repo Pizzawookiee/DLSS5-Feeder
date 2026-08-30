@@ -89,6 +89,8 @@ jobs:
             /OUT:build\dlss5-feed.addon64 ^
             build\version.res ^
             external\ngx\libs\nvsdk_ngx_d.lib ^
+            d3d12.lib ^
+            d3dcompiler.lib ^
             kernel32.lib ^
             user32.lib ^
             advapi32.lib ^
