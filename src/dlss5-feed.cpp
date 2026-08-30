@@ -38,7 +38,7 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.2.4-dx12-lifetime"
+#define FEED_VERSION "0.2.5-dx12-eval-nocopy"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -203,7 +203,7 @@ static bool CfgReload()
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
     fclose(f);
-    if (next.mode < 0 || next.mode > 4) next.mode = g_cfg.mode;
+    if (next.mode < 0 || next.mode > 5) next.mode = g_cfg.mode;
 
     // Modes 2/3/4 use the same native D3D12 feature contract.
     // Only crossing the no-feature/feature boundary requires recreation.
@@ -1394,7 +1394,7 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
     }
 
     // modes 3 and 4 exercise the feeder-owned NGX resource transitions.
-    if (g_cfg.mode != 3 && g_cfg.mode != 4)
+    if (g_cfg.mode != 3 && g_cfg.mode != 4 && g_cfg.mode != 5)
     {
         Breadcrumb("idle");
         return;
@@ -1529,7 +1529,25 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
     BarrierOn(list, g12.tex[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     BarrierOn(list, g12.tex[SLOT_COLOR], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 
-    if (eval_index <= 10)
+    
+    if (g_cfg.mode == 5)
+    {
+        BarrierOn(list, g12.tex[SLOT_OUTPUT],
+                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                  D3D12_RESOURCE_STATE_COMMON);
+
+        const UINT64 n = ++g12.frames_done;
+        g12.consecutive_fails = 0;
+        Breadcrumb("idle");
+
+        if (n <= 10 || (n % 600) == 0)
+            Log("[feed12] evaluate-no-copy frame %llu completed (%ux%u reset=%d)",
+                n, g12.width, g12.height, reset);
+
+        return;
+    }
+
+if (eval_index <= 10)
         Log("[feed12] frame %llu evaluate succeeded; beginning output copy-back",
             eval_index);
 
