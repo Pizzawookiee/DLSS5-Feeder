@@ -38,7 +38,7 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.2.1-dx12-staged"
+#define FEED_VERSION "0.2.2-dx12-diag"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -128,7 +128,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 struct Cfg
 {
     int   enabled;         // 0 = do nothing at all
-    int   mode;            // 0 inert, 1 transport only (copies the input back, no NGX), 2 full DLSS path
+    int   mode;            // DX12: 0 off, 1 staging, 2 create-only, 3 full evaluate; D3D11 keeps legacy 0/1/2
     int   hdr;             // -1 auto (FP16/R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR
     int   depth_inverted;  // -1 auto (RESHADE_DEPTH_INPUT_IS_REVERSED), 0 no, 1 yes
     int   flags;           // -1 auto, else raw DLSS.Feature.Create.Flags
@@ -203,10 +203,18 @@ static bool CfgReload()
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
     fclose(f);
-    if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
+    if (next.mode < 0 || next.mode > 3) next.mode = g_cfg.mode;
 
-    const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
-                         next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild;
+    const bool mode_rebuild =
+        next.mode != g_cfg.mode &&
+        ((next.mode >= 2) || (g_cfg.mode >= 2));
+
+    const bool rebuild =
+        next.hdr != g_cfg.hdr ||
+        next.depth_inverted != g_cfg.depth_inverted ||
+        next.flags != g_cfg.flags ||
+        next.rebuild != g_cfg.rebuild ||
+        mode_rebuild;
     const bool changed = rebuild || memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (!changed) return false;
     g_cfg = next;
@@ -981,6 +989,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
 // ---------------------------------------------------------------------------
 // DX12_NATIVE_FEED_PATCH
 // DX12_STAGED_INPUTS_PATCH
+// DX12_DIAGNOSTIC_MODES_PATCH
 //
 // This revision stages ReShade COLOR/MV/Depth into feeder-owned resources.
 // NGX never receives a ReShade-owned resource.
@@ -1138,11 +1147,11 @@ static bool BuildResources12(ID3D12GraphicsCommandList *list, UINT w, UINT h, DX
         return false;
     }
 
-    if (g_cfg.mode < 2)
+    if (g_cfg.mode == 1)
     {
-        g12.feature_ready = true;
+        g12.feature_ready = false;
         g12.need_reset = true;
-        Log("[feed12] staging resources ready (mode=%d, NGX feature not created)", g_cfg.mode);
+        Log("[feed12] staging resources ready (mode=1, NGX feature not created)");
         return true;
     }
 
@@ -1164,8 +1173,14 @@ static bool BuildResources12(ID3D12GraphicsCommandList *list, UINT w, UINT h, DX
     cp.InFeatureCreateFlags = flags;
     cp.InEnableOutputSubrects = false;
 
+    Breadcrumb("DX12: before CreateFeature");
+    Log("[feed12] before CreateFeature mode=%d %ux%u flags=%d",
+        g_cfg.mode, w, h, flags);
+
     DWORD ccode = 0;
     NVSDK_NGX_Result rf = SafeCreateDLSS12(list, &cp, &ccode);
+
+    Breadcrumb("DX12: after CreateFeature");
 
     if (ccode || NVSDK_NGX_FAILED(rf) || !g12.feature)
     {
@@ -1175,6 +1190,9 @@ static bool BuildResources12(ID3D12GraphicsCommandList *list, UINT w, UINT h, DX
             Warn("native D3D12 CreateFeature failed 0x%08X (%s)", rf, NgxResultName(rf));
         return false;
     }
+
+    Log("[feed12] after CreateFeature -> 0x%08X (%s), feature=%p",
+        rf, NgxResultName(rf), g12.feature);
 
     Log("[feed12] feature ready: %ux%u DLAA, owned color/output %s, depth R32_FLOAT, mv R16G16_FLOAT",
         w, h, FormatName(g12.color_fmt));
@@ -1260,7 +1278,11 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
     if (!dev12 || !list) return;
 
     if ((g12.frames_done % 60) == 0 && CfgReload())
-        g12.feature_ready = false;
+    {
+        Log("[feed12] config change requires DX12 rebuild/reset");
+        ReleaseFrameResources12();
+        g12.need_reset = true;
+    }
 
     reshade::api::resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
     if (g.mv_var.handle) rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
@@ -1298,10 +1320,20 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
 
     const DXGI_FORMAT typed_color = TypedColorFormat(cd.Format);
 
-    if (!g12.feature_ready ||
+    const bool need_resources =
         g12.width != (UINT)cd.Width ||
         g12.height != cd.Height ||
-        g12.color_fmt != typed_color)
+        g12.color_fmt != typed_color ||
+        g12.tex[SLOT_COLOR] == nullptr ||
+        g12.tex[SLOT_OUTPUT] == nullptr ||
+        g12.tex[SLOT_DEPTH] == nullptr ||
+        g12.tex[SLOT_MV] == nullptr;
+
+    const bool need_feature =
+        g_cfg.mode >= 2 &&
+        (!g12.feature_ready || g12.feature == nullptr);
+
+    if (need_resources || need_feature)
     {
         Log("[feed12] source descriptors: color=%llux%u %s flags=0x%X | mv=%llux%u %s flags=0x%X | depth=%llux%u %s flags=0x%X",
             (unsigned long long)cd.Width, cd.Height, FormatName(cd.Format), (unsigned)cd.Flags,
@@ -1318,13 +1350,32 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
     if (!StageInputs12(list, color, mv, depth))
         return;
 
-    // mode=1 is now a real staging/barrier test.
+    // mode=1 is a real staging/barrier test.
     if (g_cfg.mode == 1)
     {
         const UINT64 n = ++g12.frames_done;
         g12.consecutive_fails = 0;
         if (n <= (UINT64)g_cfg.log_frames)
             Log("[feed12] staging-only frame %llu completed", n);
+        Breadcrumb("idle");
+        return;
+    }
+
+    // mode=2 creates the feature but NEVER evaluates it.
+    if (g_cfg.mode == 2)
+    {
+        const UINT64 n = ++g12.frames_done;
+        g12.consecutive_fails = 0;
+        if (n <= 10 || (n % 600) == 0)
+            Log("[feed12] create-only frame %llu stable; feature=%p", n, g12.feature);
+        Breadcrumb("idle");
+        return;
+    }
+
+    // mode=3 is the only full EvaluateFeature path.
+    if (g_cfg.mode != 3)
+    {
+        Breadcrumb("idle");
         return;
     }
 
@@ -1361,8 +1412,22 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
     ep.InPreExposure = 1.0f;
     ep.InExposureScale = 1.0f;
 
+    const UINT64 eval_index = g12.frames_done + 1;
+
+    if (eval_index <= 10)
+        Log("[feed12] before Evaluate frame %llu feature=%p reset=%d",
+            eval_index, g12.feature, reset);
+
+    Breadcrumb("DX12: inside EvaluateFeature");
+
     DWORD ecode = 0;
     NVSDK_NGX_Result re = SafeEvaluateDLSS12(list, &ep, &ecode);
+
+    Breadcrumb("DX12: after EvaluateFeature");
+
+    if (eval_index <= 10)
+        Log("[feed12] Evaluate frame %llu returned 0x%08X (%s), exception=0x%08X",
+            eval_index, re, NgxResultName(re), ecode);
 
     if (ecode || NVSDK_NGX_FAILED(re))
     {
@@ -1386,6 +1451,12 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
     BarrierOn(list, g12.tex[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     BarrierOn(list, g12.tex[SLOT_COLOR], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 
+    if (eval_index <= 10)
+        Log("[feed12] frame %llu evaluate succeeded; beginning output copy-back",
+            eval_index);
+
+    Breadcrumb("DX12: output copy-back");
+
     BarrierOn(list, g12.tex[SLOT_OUTPUT],
               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
               D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1405,7 +1476,9 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
     const UINT64 n = ++g12.frames_done;
     g12.consecutive_fails = 0;
 
-    if (n <= (UINT64)g_cfg.log_frames || (n % 1800) == 0)
+    Breadcrumb("idle");
+
+    if (n <= 10 || (n % 1800) == 0)
         Log("[feed12] staged frame %llu delivered (%ux%u reset=%d)",
             n, g12.width, g12.height, reset);
 
@@ -1453,7 +1526,7 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
 
 static void FeedFrameD3D11(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
-    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
+    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0 || g_cfg.mode == 3) return;
 
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
