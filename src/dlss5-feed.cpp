@@ -30,6 +30,10 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
+#include <vulkan/vulkan.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
@@ -1639,14 +1643,17 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
+#include "vulkan-feed.inl"
+
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
     switch (rt->get_device()->get_api())
     {
-    case reshade::api::device_api::d3d11: FeedFrame11(rt, cl, rtv); break;
-    case reshade::api::device_api::d3d12: FeedFrame12(rt, cl, rtv); break;
-    default: FeedDisable("only Direct3D 11 and 12 games are supported"); break;
+    case reshade::api::device_api::d3d11:  FeedFrame11(rt, cl, rtv); break;
+    case reshade::api::device_api::d3d12:  FeedFrame12(rt, cl, rtv); break;
+    case reshade::api::device_api::vulkan: FeedFrameVK(rt, cl, rtv); break;
+    default: FeedDisable("only Direct3D 11, Direct3D 12 and Vulkan games are supported"); break;
     }
 }
 
@@ -1696,7 +1703,7 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
     // device: give it a fresh feature (a cheap feature-only re-create -- the textures stay).
     // On the same-device D3D12 path its hooks live on the game's device and survive; the
     // feature must NOT be touched (re-creating a live one is where the add-on crashes).
-    if (g.session_ready && g.dev12_owned) g.frame_ready = false;
+    if (g.session_ready && g.dev12_owned && !gv.active) g.frame_ready = false;
     // Either way the add-on may be re-patching its NGX hooks right now: hold any upcoming
     // feature create for a fresh grace period.
     g.create_grace = 0;
@@ -1715,7 +1722,7 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
     // survive runtime churn -- keep them. Every feature create near a hook re-arm has been
     // a crash risk (EXEC 0x0 inside the add-on, sometimes fatal on a foreign thread), so
     // the fewer creates, the better.
-    if (g.dev12_owned) ReleaseFrameResources();
+    if (g.dev12_owned && !gv.active) ReleaseFrameResources();
     g.runtime = nullptr;
     g.technique = {}; g.launchpad = {}; g.mv_var = {}; g.depth_var = {};
     g.handles_ok = false;
@@ -1736,6 +1743,15 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
 
 static void OnDestroyDevice(reshade::api::device *dev)
 {
+    if (gv.active &&
+        dev->get_api() == reshade::api::device_api::vulkan &&
+        reinterpret_cast<VkDevice>(dev->get_native()) == gv.device)
+    {
+        Log("[feed-vk] game Vulkan device is being destroyed");
+        ShutdownVulkanSession();
+        return;
+    }
+
     if (g.dev11 != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev11)
     {
         Log("[feed] D3D11 device destroyed; shutting the session down");
@@ -1788,7 +1804,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
-        ShutdownSession();
+        if (gv.active) ShutdownVulkanSession();
+        else ShutdownSession();
         reshade::unregister_addon(module);
         Log("shut down cleanly.");
     }

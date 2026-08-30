@@ -230,6 +230,49 @@ add-on — outputs `host\dlss5-feed-host64.exe`). `spike\build-spike.bat` builds
 * **D3D12 stability findings** independently confirmed by the
   [Pizzawookiee fork](https://github.com/Pizzawookiee/DLSS5-Feeder)'s diagnostics.
 
+
+## Experimental Vulkan backend
+
+The `vulkan_test` branch adds a Vulkan path while keeping the same guide source as the D3D11/D3D12
+feeder: **iMMERSE LaunchPad optical-flow motion vectors plus `DLSS5_Feed.fx` raw depth**.
+
+The Vulkan MVP follows the FNV/DXVK-Remix raster-host precedent:
+
+```text
+Vulkan/ReShade frame + LaunchPad MV + DLSS5_Feed depth
+        ↓
+Vulkan blit/copy into D3D12-shared FP16/R32F/RG16F images
+        ↓
+private D3D12 NGX DLAA evaluate
+        ↓
+RenoDX DLSS 5 observes/injects into that D3D12 contract
+        ↓
+shared FP16 output
+        ↓
+Vulkan fullscreen blit back into the ReShade render target
+```
+
+The Vulkan and D3D12 queues are ordered with a shared D3D12 fence imported as a Vulkan timeline
+semaphore. The composite deliberately uses a Vulkan blit rather than replacing the game image.
+
+This uses the interop-host route instead of directly creating Vulkan feature 18 from the add-on.
+ReShade's public Vulkan add-on API exposes `VkDevice`, `VkQueue`, `VkCommandBuffer`, and `VkImage`,
+but not the parent `VkInstance`/`VkPhysicalDevice` pair required by the 310.8 native Vulkan DLSSNR
+initialization used by the FNV patch. The interop host also preserves compatibility with RenoDX's
+D3D12 NGX interception path.
+
+The game/ReShade Vulkan device must have the Win32 external-memory, external-semaphore and timeline
+semaphore functionality enabled. If not, `dlss5-feed.log` reports the missing Vulkan entry point or
+interop setup failure and disables the feeder without intentionally changing the game frame.
+
+### Vulkan build
+
+The x64 build requires Vulkan headers. `build.bat` accepts either `%VULKAN_SDK%` or Khronos
+Vulkan-Headers checked out under `external\vulkan`.
+
+GitHub Actions fetches Vulkan-Headers and the NVIDIA DLSS SDK automatically, builds the add-on, and
+uploads `dlss5-feed.addon64`, `DLSS5_Feed.fx`, and `README.md` as a workflow artifact.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). This covers only the code in this repository (`src/`, `shaders/`,
