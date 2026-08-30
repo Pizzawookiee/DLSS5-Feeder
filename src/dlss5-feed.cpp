@@ -38,7 +38,7 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.2.2-dx12-diag"
+#define FEED_VERSION "0.2.3-dx12-barrier-diag"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -128,7 +128,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 struct Cfg
 {
     int   enabled;         // 0 = do nothing at all
-    int   mode;            // DX12: 0 off, 1 staging, 2 create-only, 3 full evaluate; D3D11 keeps legacy 0/1/2
+    int   mode;            // DX12: 0 off, 1 staging, 2 create-only, 3 barrier-only, 4 full evaluate; D3D11 keeps legacy 0/1/2
     int   hdr;             // -1 auto (FP16/R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR
     int   depth_inverted;  // -1 auto (RESHADE_DEPTH_INPUT_IS_REVERSED), 0 no, 1 yes
     int   flags;           // -1 auto, else raw DLSS.Feature.Create.Flags
@@ -203,7 +203,7 @@ static bool CfgReload()
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
     fclose(f);
-    if (next.mode < 0 || next.mode > 3) next.mode = g_cfg.mode;
+    if (next.mode < 0 || next.mode > 4) next.mode = g_cfg.mode;
 
     const bool mode_rebuild =
         next.mode != g_cfg.mode &&
@@ -990,6 +990,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
 // DX12_NATIVE_FEED_PATCH
 // DX12_STAGED_INPUTS_PATCH
 // DX12_DIAGNOSTIC_MODES_PATCH
+// DX12_BARRIER_DIAGNOSTIC_PATCH
 //
 // This revision stages ReShade COLOR/MV/Depth into feeder-owned resources.
 // NGX never receives a ReShade-owned resource.
@@ -1372,27 +1373,84 @@ static void FeedFrameD3D12(reshade::api::effect_runtime *rt,
         return;
     }
 
-    // mode=3 is the only full EvaluateFeature path.
-    if (g_cfg.mode != 3)
+    // modes 3 and 4 exercise the feeder-owned NGX resource transitions.
+    if (g_cfg.mode != 3 && g_cfg.mode != 4)
     {
         Breadcrumb("idle");
         return;
     }
 
-    // From here onward every resource is feeder-owned.
+    const UINT64 barrier_index = g12.frames_done + 1;
+
+    if (barrier_index <= 10)
+        Log("[feed12] before NGX input barriers frame %llu", barrier_index);
+    Breadcrumb("DX12: before NGX input barriers");
+
     BarrierOn(list, g12.tex[SLOT_COLOR],
               D3D12_RESOURCE_STATE_COMMON,
               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (barrier_index <= 10)
+        Log("[feed12] after color barrier frame %llu", barrier_index);
+    Breadcrumb("DX12: after color barrier");
+
     BarrierOn(list, g12.tex[SLOT_MV],
               D3D12_RESOURCE_STATE_COMMON,
               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (barrier_index <= 10)
+        Log("[feed12] after mv barrier frame %llu", barrier_index);
+    Breadcrumb("DX12: after mv barrier");
+
     BarrierOn(list, g12.tex[SLOT_DEPTH],
               D3D12_RESOURCE_STATE_COMMON,
               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (barrier_index <= 10)
+        Log("[feed12] after depth barrier frame %llu", barrier_index);
+    Breadcrumb("DX12: after depth barrier");
+
     BarrierOn(list, g12.tex[SLOT_OUTPUT],
               D3D12_RESOURCE_STATE_COMMON,
               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (barrier_index <= 10)
+        Log("[feed12] after output UAV barrier frame %llu", barrier_index);
+    Breadcrumb("DX12: after output UAV barrier");
 
+    if (g_cfg.mode == 3)
+    {
+        BarrierOn(list, g12.tex[SLOT_OUTPUT],
+                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                  D3D12_RESOURCE_STATE_COMMON);
+        if (barrier_index <= 10)
+            Log("[feed12] after output restore barrier frame %llu", barrier_index);
+
+        BarrierOn(list, g12.tex[SLOT_DEPTH],
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_COMMON);
+        if (barrier_index <= 10)
+            Log("[feed12] after depth restore barrier frame %llu", barrier_index);
+
+        BarrierOn(list, g12.tex[SLOT_MV],
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_COMMON);
+        if (barrier_index <= 10)
+            Log("[feed12] after mv restore barrier frame %llu", barrier_index);
+
+        BarrierOn(list, g12.tex[SLOT_COLOR],
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_COMMON);
+        if (barrier_index <= 10)
+            Log("[feed12] after color restore barrier frame %llu", barrier_index);
+
+        const UINT64 n = ++g12.frames_done;
+        g12.consecutive_fails = 0;
+        Breadcrumb("idle");
+
+        if (n <= 10 || (n % 600) == 0)
+            Log("[feed12] barrier-only frame %llu stable", n);
+
+        return;
+    }
+
+    // mode=4 continues into the full EvaluateFeature path.
     const int reset = (g12.need_reset || g_cfg.reset_every) ? 1 : 0;
     g12.need_reset = false;
 
@@ -1526,7 +1584,7 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
 
 static void FeedFrameD3D11(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
-    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0 || g_cfg.mode == 3) return;
+    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0 || g_cfg.mode >= 3) return;
 
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
